@@ -1,0 +1,313 @@
+---
+title: "Functional Enrichment Analysis"
+author: "Jakob Giesler"
+date: "3/21/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<br>
+**1. load packages**
+```{r load packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(writexl)
+library(ggthemes)
+library(ggradar)
+detach(package:plyr)
+```
+
+<br>
+**2. set up script**<br>
+clean environment, set working directory, set global options
+```{r housekeeping, message=FALSE, warning=FALSE}
+rm(list = ls())
+setwd("/PATH")
+```
+
+<br>
+**3. import data**
+```{r import, message=FALSE, warning=FALSE}
+#import annotated reference transcriptome
+egg <- read_xlsx("/polyA_eggnog_annotations.xlsx")
+
+#import overall up- and down regulation files (across treatments)
+intersect_up <- read_xlsx("upregulated_in_xe.xlsx")
+intersect_down <- read_xlsx("downregulated_in_xe.xlsx")
+```
+
+<br>
+**4. Creating COG category count tables**<br>
+Now we will compare the abundance of genes in the results files belonging to a set of overarching processes to their respective abundances in the reference transcriptome to determine processes that are significantly more affected by the presence of bacteria.
+```{r count tables,  message=FALSE, warning=FALSE}
+
+#first we determine the abundance of respective cog categories in the background dataset (reference transcriptome)
+ref_cog <- data.frame(Column_With_Letters = egg$COG_category)
+
+# Function to count occurrences of each letter
+count_letters <- function(string) {
+  # Convert string to uppercase to make counts case-insensitive
+  string <- toupper(string)
+  # Split the string into individual letters
+  letters <- unlist(strsplit(string, ""))
+  # Count occurrences of each letter
+  letter_counts <- table(letters)
+  # Convert to data frame
+  data.frame(letter = names(letter_counts), count = as.numeric(letter_counts), stringsAsFactors = FALSE)
+}
+
+letter_counts_list <- lapply(ref_cog$Column_With_Letters, count_letters) #apply function
+total_counts <- do.call(rbind, letter_counts_list) # gather data
+
+# Combine counts from all elements into a single data frame
+total_counts <- total_counts %>%
+  dplyr::group_by(letter) %>%
+  summarise(count = sum(count))
+
+total_counts <- total_counts[2:25,] #remove not annotated symbol "-"
+total_counts <- dplyr::rename(total_counts, "COG_category" = letter) 
+cog_processes <- read_xlsx("cog_categories.xlsx") #import cog categories
+total_counts <- left_join(total_counts, cog_processes, by="COG_category")
+total_counts <- group_by(total_counts, process)
+total_counts <- mutate(total_counts, rel_cog = count/sum(count))
+
+
+#now lets calculate the same for our up- and down regulated datasets
+
+#upregulated
+up_cog <- data.frame(Column_With_Letters = intersect_up$COG_category)
+letter_counts_list <- lapply(up_cog$Column_With_Letters, count_letters)
+up_total_counts <- do.call(rbind, letter_counts_list)
+
+up_total_counts <- up_total_counts %>%
+  group_by(letter) %>%
+  summarise(count = sum(count))
+
+up_total_counts <- up_total_counts[2:22,] #remove not annotated symbol "-"
+up_total_counts <- dplyr::rename(up_total_counts, "COG_category" = letter) 
+up_total_counts <- left_join(up_total_counts, cog_processes, by="COG_category")
+up_total_counts <- group_by(up_total_counts, process)
+up_total_counts <- mutate(up_total_counts, rel_cog = count/sum(count))
+
+
+#downregulated
+down_cog <- data.frame(Column_With_Letters = intersect_down$COG_category)
+letter_counts_list <- lapply(down_cog$Column_With_Letters, count_letters)
+down_total_counts <- do.call(rbind, letter_counts_list)
+
+down_total_counts <- down_total_counts %>%
+  group_by(letter) %>%
+  summarise(count = sum(count))
+
+down_total_counts <- down_total_counts[2:22,] #remove not annotated symbol "-"
+down_total_counts <- dplyr::rename(down_total_counts, "COG_category" = letter) 
+down_total_counts <- left_join(down_total_counts, cog_processes, by="COG_category")
+down_total_counts <- group_by(down_total_counts, process)
+down_total_counts <- mutate(down_total_counts, rel_cog = count/sum(count))
+```
+
+<br>
+**5. plotting metabolism**
+```{r plot metabolism,  message=FALSE, warning=FALSE}
+
+#metabolism
+
+ref_met <- dplyr::filter(total_counts, process == "metabolism")
+up_met <- dplyr::filter(up_total_counts, process == "metabolism")
+down_met <- dplyr::filter(down_total_counts, process == "metabolism")
+
+ref_met <- ref_met[,c(1,4)]
+up_met <- up_met[,c(1,4)]
+down_met <- down_met[,c(1,4)]
+
+
+ref_met <- spread(ref_met, key = COG_category, value = rel_cog)
+up_met <- spread(up_met, key = COG_category, value = rel_cog)
+down_met <- spread(down_met, key = COG_category, value = rel_cog)
+
+
+ref_met <- mutate(ref_met, group = "reference")
+up_met <- mutate(up_met, group = "up_xe")
+down_met <- mutate(down_met, group = "down_xe")
+
+
+ref_met <- ref_met[,c(9,1:8)]
+up_met <- up_met[,c(9,1:8)]
+down_met <- down_met[,c(9,1:8)]
+
+
+met <- rbind(ref_met, up_met, down_met)
+
+library(qualpalr)
+library(viridis)
+
+p_metabolism <- ggradar(
+  met, 
+  values.radar = c("0", "0.1", "0.25"),
+  grid.min = 0, grid.mid = 0.1, grid.max = 0.25,
+  # Polygons
+  group.line.width = 1, 
+  group.point.size = 4,
+  # Background and grid lines
+  background.circle.colour = "white",
+  gridline.mid.colour = "grey",
+  legend.position = "left"
+)
+p_metabolism
+
+#ggsave("met_radar.pdf", p_metabolism, device = "pdf", width = 10, height = 7, dpi = 300)
+
+```
+
+<br>
+**6. plotting cellular processes signalling**
+```{r plot cellular processes signalling,  message=FALSE, warning=FALSE}
+
+#cellular processes signalling
+
+ref_cel <- dplyr::filter(total_counts, process == "cellular_processes_signaling")
+up_cel <- dplyr::filter(up_total_counts, process == "cellular_processes_signaling")
+down_cel <- dplyr::filter(down_total_counts, process == "cellular_processes_signaling")
+
+ref_cel <- ref_cel[,c(1,4)]
+up_cel <- up_cel[,c(1,4)]
+down_cel <- down_cel[,c(1,4)]
+
+ref_cel <- spread(ref_cel, key = COG_category, value = rel_cog)
+up_cel <- spread(up_cel, key = COG_category, value = rel_cog)
+down_cel <- spread(down_cel, key = COG_category, value = rel_cog)
+
+ref_cel <- mutate(ref_cel, group = "reference")
+up_cel <- mutate(up_cel, group = "up_xe")
+down_cel <- mutate(down_cel, group = "down_xe")
+
+ref_cel <- ref_cel[,c(11,1:10)]
+up_cel <- up_cel[,c(8,1:7)]
+down_cel <- down_cel[,c(8,1:7)]
+
+
+all_dfs <- list(ref_cel, up_cel, down_cel)
+
+merged_cel <- Reduce(function(x, y) merge(x, y, all = TRUE), all_dfs)
+merged_cel[is.na(merged_cel)] <- 0
+
+  
+p_cel_proc_sig <- ggradar(
+  merged_cel, 
+  values.radar = c("0", "0.25", "0.5"),
+  grid.min = 0, grid.mid = 0.25, grid.max = 0.5,
+  # Polygons
+  group.line.width = 1, 
+  group.point.size = 4,
+  # Background and grid lines
+  background.circle.colour = "white",
+  gridline.mid.colour = "grey",
+  legend.position = "left"
+)
+p_cel_proc_sig
+
+#ggsave("cel_radar.pdf", p_cel_proc_sig, device = "pdf", width = 10, height = 7, dpi = 300)
+
+```
+
+<br>
+**7. plotting information storage processing**
+```{r plot information storage processing,  message=FALSE, warning=FALSE}
+
+#plotting information storage processing
+
+ref_inf <- dplyr::filter(total_counts, process == "information_storage_processing")
+up_inf <- dplyr::filter(up_total_counts, process == "information_storage_processing")
+down_inf <- dplyr::filter(down_total_counts, process == "information_storage_processing")
+
+ref_inf <- ref_inf[,c(1,4)]
+up_inf <- up_inf[,c(1,4)]
+down_inf <- down_inf[,c(1,4)]
+
+
+ref_inf <- spread(ref_inf, key = COG_category, value = rel_cog)
+up_inf <- spread(up_inf, key = COG_category, value = rel_cog)
+down_inf <- spread(down_inf, key = COG_category, value = rel_cog)
+
+ref_inf <- mutate(ref_inf, group = "reference")
+up_inf <- mutate(up_inf, group = "up_xe")
+down_inf <- mutate(down_inf, group = "down_xe")
+
+ref_inf <- ref_inf[,c(6,1:5)]
+up_inf <- up_inf[,c(6,1:5)]
+down_inf <- down_inf[,c(6,1:5)]
+
+inf <- rbind(ref_inf, up_inf, down_inf)
+
+p_inf_proc_stor <- ggradar(
+  inf, 
+  values.radar = c("0", "0.25", "0.5"),
+  grid.min = 0, grid.mid = 0.25, grid.max = 0.5,
+  # Polygons
+  group.line.width = 1, 
+  group.point.size = 4,
+  background.circle.colour = "white",
+  gridline.mid.colour = "grey",
+  legend.position = "left"
+)
+p_inf_proc_stor
+
+#ggsave("inf_radar.pdf", p_inf_proc_stor, device = "pdf", width = 10, height = 7, dpi = 300)
+
+```
+
+<br>
+**8. statistical testing**<br>
+Formula:<br>
+x <- "count of specific process within the test group (e.g. amino acid metabolism within Arctic)"
+m <- "count of specific process in the background data set (e.g. amino acid metabolism count all Orthogroups)"
+n <- "count of all specific processes in the background data set (e.g. metabolism count all Orthogroups)” - m
+k <- "count of all specific processes within the test group (e.g. metabolism count within Arctic)"
+pval_delpleted <- phyper(x,m,n,k,lower.tail = TRUE)
+pval_enriched <- phyper(x-1,m,n,k,lower.tail = FALSE)
+
+```{r statistics of enrichment,  message=FALSE, warning=FALSE}
+total_counts_copy <- total_counts
+up_total_counts_copy <- up_total_counts
+up_total_counts_copy <- dplyr::rename(up_total_counts_copy, "counts_up" = count)
+down_total_counts_copy <- down_total_counts
+down_total_counts_copy <- dplyr::rename(down_total_counts_copy, "counts_down" = count)
+
+df <- left_join(total_counts_copy, up_total_counts_copy, by = "COG_category")
+df <- left_join(df, down_total_counts_copy, by = "COG_category")
+df <- df[,c(1:3,5,8)]
+df$counts_up[is.na(df$counts_up)] <- 0
+df$counts_down[is.na(df$counts_down)] <- 0
+
+df <- group_by(df, process.x)
+df <- mutate(df, sum_counts = sum(count), up_sum_counts = sum(counts_up), down_sum_counts = sum(counts_down))
+df <- mutate(df, up_pval_depleted = phyper(counts_up, count, sum_counts, up_sum_counts, lower.tail = TRUE))
+df <- mutate(df, up_pval_enriched = phyper(counts_up - 1, count, sum_counts, up_sum_counts, lower.tail = FALSE))
+df <- mutate(df, down_pval_depleted = phyper(counts_down, count, sum_counts, down_sum_counts, lower.tail = TRUE))
+df <- mutate(df, down_pval_enriched = phyper(counts_down - 1, count, sum_counts, down_sum_counts, lower.tail = FALSE))
+df <- df[,c(1,4:5,9:12)]
+
+#cutoff processes with less than 5 genes
+df$up_pval_depleted <- ifelse(df$counts_up<5, paste("NA"), df$up_pval_depleted)
+df$up_pval_enriched <- ifelse(df$counts_up<5, paste("NA"), df$up_pval_enriched)
+df$down_pval_depleted <- ifelse(df$counts_down<5, paste("NA"), df$down_pval_depleted)
+df$down_pval_enriched <- ifelse(df$counts_down<5, paste("NA"), df$down_pval_enriched)
+```
+
+<br>
+**9. subset for signifciant processes**
+```{r subsetting results, message=FALSE, warning=FALSE}
+#significant COG Categories in the upregulated intersection of all treatments
+intersect_up_sub <- dplyr::filter(intersect_up, COG_category == "M" | COG_category == "O" | COG_category == "L" | COG_category == "B" | COG_category == "J" | COG_category == "F" | COG_category == "I" )
+#write_xlsx( intersect_up_sub, "signif_processes_up.xlsx")
+
+#significant COG Categories in the downregulated intersection of all treatments
+intersect_down_sub <- dplyr::filter(intersect_down, COG_category == "W" | COG_category == "O" | COG_category == "A" | COG_category == "Q" | COG_category == "P")
+#write_xlsx(intersect_down_sub, "signif_processes_down.xlsx")
+
+```
+

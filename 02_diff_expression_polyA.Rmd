@@ -1,0 +1,380 @@
+---
+title: "Host mRNA differential expression analysis"
+author: "Jakob Giesler"
+date: "3/12/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<br>
+**1. load packages**
+```{r load packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(BiocManager)
+library(DESeq2)
+library(knitr)
+#library(UpSetR)
+library(readxl)
+library(writexl)
+library(ggthemes)
+library(ggradar)
+```
+
+<br>
+**2. set up script (clean environment, set working directory, set global options)**
+```{r housekeeping, message=FALSE, warning=FALSE}
+rm(list = ls())
+setwd("/PATH")
+```
+
+<br>
+**3. create gene count matrix**
+```{r matrix, message=FALSE, warning=FALSE}
+file_list <- list.files("count_tables", pattern = "counts.short.txt$", full.names = TRUE)
+
+##Merging the Files into a single data frames
+#Format Names
+GeneID <- read.delim("count_tables/WP2-RNA-26-euk_S22.counts.short.txt", header=TRUE)
+GeneID <- GeneID$Geneid
+GeneID <- as.data.frame(GeneID)
+
+#bind the second column from each file into one file, make the rownames the Gene_ID
+df <- do.call(cbind,lapply(file_list,function(fn)read.delim(fn,header=TRUE)[,7]))
+rownames(df) <- GeneID$GeneID
+df <- as.data.frame(df)
+
+#make the colnames according to sample names, reformat the names
+temp = as.data.frame(list.files("count_tables", pattern="*"))
+colnames(temp) <- 'FileName'
+
+#set sample names 
+temp$SampleName <- sub("\\..*$", "", temp$FileName)
+names <- temp
+colnames(df) <- names$SampleName
+
+#create matrix
+count_mat <- as.matrix(df)
+
+```
+
+<br>
+**4. create meta file**
+```{r sample-info,  message=FALSE, warning=FALSE}
+sample_info <- read_xlsx("wp2_meta.xlsx")
+df_rownames <- sample_info$Sample
+sample_info <- sample_info[,1:3]
+rownames(sample_info) <- df_rownames
+```
+
+<br>
+**5. create metafile and matrix subsets**<br>
+Note, that it is recommended to keep the design as simple as possible to obtain interpetable results.
+Therefore,we create multiple deseq objects for each condition that will be analysed separately to reduce the dimensionality.
+```{r subsetting,  message=FALSE, warning=FALSE}
+#start with metafiles
+invisible(capture.output({
+meta_t9_p16 <- dplyr::filter(sample_info, Temperature == "9", Photoperiod == "16")
+droplevels(meta_t9_p16)
+
+meta_t9_p24 <- dplyr::filter(sample_info, Temperature == "9", Photoperiod == "24")
+droplevels(meta_t9_p24)
+
+meta_t13_p16 <- dplyr::filter(sample_info, Temperature == "13.5", Photoperiod == "16")
+droplevels(meta_t13_p16)
+
+meta_t13_p24 <- dplyr::filter(sample_info, Temperature == "13.5", Photoperiod == "24")
+droplevels(meta_t13_p24)
+
+#now create matrix subsets based on the samples in subsetted metafiles
+mat_t9_p16 <- count_mat[, rownames(meta_t9_p16), drop = FALSE]
+mat_t9_p24 <- count_mat[, rownames(meta_t9_p24), drop = FALSE]
+mat_t13_p16 <- count_mat[, rownames(meta_t13_p16), drop = FALSE]
+mat_t13_p24 <- count_mat[, rownames(meta_t13_p24), drop = FALSE]
+}))
+```
+
+<br>
+**6. create DEseq2 object (via DESeqDataSet)**
+```{r deseq,  message=FALSE, warning=FALSE}
+#create DESeqDataSets from subsets
+invisible(capture.output({
+dds_t9_p16 <- DESeqDataSetFromMatrix(countData = mat_t9_p16,
+                              colData = meta_t9_p16,
+                              design= ~ Bacteria)
+
+dds_t9_p24 <- DESeqDataSetFromMatrix(countData = mat_t9_p24,
+                              colData = meta_t9_p24,
+                              design= ~ Bacteria)
+
+dds_t13_p16 <- DESeqDataSetFromMatrix(countData = mat_t13_p16,
+                              colData = meta_t13_p16,
+                              design= ~ Bacteria)
+
+dds_t13_p24 <- DESeqDataSetFromMatrix(countData = mat_t13_p24,
+                              colData = meta_t13_p24,
+                              design= ~ Bacteria)
+
+#also, we will create one object containing all data
+dds <- DESeqDataSetFromMatrix(countData = count_mat,
+                              colData = sample_info,
+                              design= ~ Temperature+Photoperiod+Bacteria)
+
+
+
+#remove rows with low read counts
+dds_t9_p16  <- dds_t9_p16[rowSums(counts(dds_t9_p16))>10]
+dds_t9_p24  <- dds_t9_p24[rowSums(counts(dds_t9_p24))>10]
+dds_t13_p16  <- dds_t13_p16[rowSums(counts(dds_t13_p16))>10]
+dds_t13_p24  <- dds_t13_p24[rowSums(counts(dds_t13_p24))>10]
+dds  <- dds[rowSums(counts(dds))>10]
+
+#create DESeq objects
+dds_t9_p16  <- DESeq(dds_t9_p16)
+dds_t9_p24  <- DESeq(dds_t9_p24)
+dds_t13_p16  <- DESeq(dds_t13_p16)
+dds_t13_p24  <- DESeq(dds_t13_p24)
+dds <- DESeq(dds)
+
+}))
+#inspect objects
+dds_t9_p16
+dds_t9_p24
+dds_t13_p16
+dds_t13_p24
+dds
+
+```
+
+<br>
+**7. PCA of overall DESeq results**<br>
+Therefore, we will have a look at the dds object containing all samples, not the subsetted ones.
+```{r plotting,  message=FALSE, warning=FALSE}
+#PCA of all samples
+vsd <- vst(dds, blind=FALSE)
+
+vsd_df <- data.frame(assay(vsd))
+
+#If you want to do boxplots of the diff expr. analysis (of some specific genes) access the results like this:
+#vsd_sub <- subset(vsd_df, rownames(vsd_df) == "cds.NODE_10026_length_2545_cov_452.071314_g5961_i0.p1")
+
+#PCA of the 500 most variable expressed genes
+
+pca <- plotPCA(vsd, intgroup=c("Temperature", "Photoperiod", "Bacteria"), returnData =TRUE)
+head(pca)
+
+# Calculate explained variance
+variance <- round(100 * attr(pca, "percentVar"), 2)
+
+pca500 <- ggplot(pca, aes(PC1, PC2, color=Temperature, shape=Photoperiod, group = Bacteria)) +
+  geom_point(size=3) +
+  coord_fixed()+
+  scale_color_viridis_d()+
+  theme_few()+
+  ggforce::geom_mark_ellipse(aes(fill = Bacteria))+
+    labs(x = paste("PC1 (", variance[1], "%)", sep=""),
+       y = paste("PC2 (", variance[2], "%)", sep=""))
+
+pca500
+
+ #ggsave("PCA_diff500.eps", pca500, device = "eps", height = 4, width = 6, dpi = 320 )
+
+
+# Plot PCA for all genes with different attributes for factors
+pca <- prcomp(t(assay(vsd)))
+pca_scores <- as.data.frame(pca$x)
+pca_data <- cbind(pca_scores, colData(vsd))
+
+ggplot(pca_data, aes(x = PC1, y = PC2, shape = Bacteria, color = factor(Temperature), size = factor(Photoperiod)))+
+  geom_point() +
+  theme_few() +
+  labs(color = "Temperature", size = "Photoperiod", shape = "Bacteria")
+
+# Creating sample similarity heatmap
+sampleDists <- dist(t(assay(vsd)))
+
+library("RColorBrewer")
+library("pheatmap")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$Temperature, vsd$Photoperiod, vsd$Bacteria, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+<br>
+**8. Create results tables**<br>
+Here we will extract results tables from deseq2. Those tables will be filtered for significant adjusted p-values and split into two dataframes for either up- or downregulated genes, respectively.
+```{r result-tables,  message=FALSE, warning=FALSE}
+res_t9_p16 <- results(dds_t9_p16)
+res_t9_p16 <- results(dds_t9_p16, contrast=c("Bacteria","xe","ax"))
+res_t9_p16 <- as.data.frame(res_t9_p16)
+res_t9_p16 <- dplyr::filter(res_t9_p16, padj <= 0.05)
+up_t9_p16 <- dplyr::filter(res_t9_p16, log2FoldChange > 0)
+down_t9_p16 <- dplyr::filter(res_t9_p16, log2FoldChange < 0)
+
+res_t9_p24 <- results(dds_t9_p24)
+res_t9_p24 <- results(dds_t9_p24, contrast=c("Bacteria","xe","ax"))
+res_t9_p24 <- as.data.frame(res_t9_p24)
+res_t9_p24 <- dplyr::filter(res_t9_p24, padj <= 0.05)
+up_t9_p24 <- dplyr::filter(res_t9_p24, log2FoldChange > 0)
+down_t9_p24 <- dplyr::filter(res_t9_p24, log2FoldChange < 0)
+
+res_t13_p16 <- results(dds_t13_p16)
+res_t13_p16 <- results(dds_t13_p16, contrast=c("Bacteria","xe","ax"))
+res_t13_p16 <- as.data.frame(res_t13_p16)
+res_t13_p16 <- dplyr::filter(res_t13_p16, padj <= 0.05)
+up_t13_p16 <- dplyr::filter(res_t13_p16, log2FoldChange > 0)
+down_t13_p16 <- dplyr::filter(res_t13_p16, log2FoldChange < 0)
+
+res_t13_p24 <- results(dds_t13_p24)
+res_t13_p24 <- results(dds_t13_p24, contrast=c("Bacteria","xe","ax"))
+res_t13_p24 <- as.data.frame(res_t13_p24)
+res_t13_p24 <- dplyr::filter(res_t13_p24, padj <= 0.05)
+up_t13_p24 <- dplyr::filter(res_t13_p24, log2FoldChange > 0)
+down_t13_p24 <- dplyr::filter(res_t13_p24, log2FoldChange < 0)
+```
+
+<br>
+**9. Creating upset plot**<br>
+This plot illustrates the intersection of significantly up- or downregulated genes (i.e. contigs) among the different treatment combinations. Single dots represent unique genes in a respective treatment
+```{r upset,  message=FALSE, warning=FALSE}
+library(UpSetR)
+listInput <- list(upreg_t9_p16 = row.names(up_t9_p16), 
+                  upreg_t9_p24 = row.names(up_t9_p24), 
+                  upreg_t13_p16 = row.names(up_t13_p16), 
+                  upreg_t13_p24 = row.names(up_t13_p24),
+                  downreg_t9_p16 = row.names(down_t9_p16), 
+                  downreg_t9_p24 = row.names(down_t9_p24), 
+                  downreg_t13_p16 = row.names(down_t13_p16), 
+                  downreg_t13_p24 = row.names(down_t13_p24))
+order.by = "freq"
+upset(fromList(listInput), order.by = "freq", nsets = 8, sets = c("upreg_t9_p16", "upreg_t9_p24", "upreg_t13_p16", "upreg_t13_p24",
+                                                                  "downreg_t9_p16", "downreg_t9_p24", "downreg_t13_p16", "downreg_t13_p24"),
+      keep.order = TRUE, sets.x.label = "Total Number of Contigs")
+```
+
+<br>
+**10. Extracting intersections for overall xenic vs. axenic comparison**<br>
+Lets make one subset for the intersection among all significantly differential expressed genes in the up-regulated and in the down-regulated dataset, respectively (temperature and photoperiod treatments will be pooled).
+```{r extract intersections,  message=FALSE, warning=FALSE}
+#extract intersect of up-regulated genes
+intersect_up <- Reduce(intersect, list(rownames(up_t9_p16), rownames(up_t9_p24), rownames(up_t13_p16), rownames(up_t13_p24)))
+
+#extract intersect of down-regulated genes
+intersect_down <- Reduce(intersect, list(rownames(down_t9_p16), rownames(down_t9_p24), rownames(down_t13_p16), rownames(down_t13_p24)))
+
+#import annotated transcriptome:
+egg <- read_xlsx("/Users/jgiesler/Library/Mobile Documents/com~apple~CloudDocs/PhD/Manuscripts/WP2_big/Transcriptomics/Eukaryotes/transcriptome annotation/MM_8j7rdz8b.emapper.annotations.xlsx")
+
+#bind annotation info to intersections
+intersect_up <- gsub("cds.", "", intersect_up)
+intersect_up <- as.data.frame(intersect_up)
+intersect_up <- dplyr::rename(intersect_up, "query" = intersect_up)
+intersect_up <- left_join(intersect_up, egg, by="query")
+#write_xlsx(intersect_up, "upregulated_in_xe.xlsx")
+#intersect_up <- read_xlsx("upregulated_in_xe.xlsx")
+
+intersect_down <- gsub("cds.", "", intersect_down)
+intersect_down <- as.data.frame(intersect_down)
+intersect_down <- dplyr::rename(intersect_down, "query" = intersect_down)
+intersect_down <- left_join(intersect_down, egg, by="query")
+#write_xlsx(intersect_down, "downregulated_in_xe.xlsx")
+#intersect_down <- read_xlsx("downregulated_in_xe.xlsx")
+
+con_up_t9_p16 <- rownames(up_t9_p16)
+con_up_t9_p16 <- gsub("cds.", "", con_up_t9_p16)
+con_up_t9_p16 <- as.data.frame(con_up_t9_p16)
+con_up_t9_p16 <- dplyr::rename(con_up_t9_p16, "query" = con_up_t9_p16)
+con_up_t9_p16 <- left_join(con_up_t9_p16, egg, by="query")
+#write_xlsx(con_up_t9_p16, "up_t9_p16.xlsx")
+
+write_xlsx(down_t9_p16, "down_t9_p16.xlsx")
+
+write_xlsx(up_t9_p24, "up_t9_p24.xlsx")
+write_xlsx(down_t9_p24, "down_t9_p24.xlsx")
+
+write_xlsx(up_t13_p16, "up_t13_p16.xlsx")
+write_xlsx(down_t13_p16, "down_t13_p16.xlsx")
+
+write_xlsx(up_t13_p24, "up_t13_p24.xlsx")
+write_xlsx(down_t13_p24, "down_t13_p24.xlsx")
+
+```
+
+<br>
+**11. export results table for each treatment separately**
+```{r treatment results export, message=FALSE, warning=FALSE}
+
+#_______________________________________________________________________________
+
+con_up_t9_p16 <- rownames(up_t9_p16)
+con_up_t9_p16 <- gsub("cds.", "", con_up_t9_p16)
+con_up_t9_p16 <- as.data.frame(con_up_t9_p16)
+con_up_t9_p16 <- dplyr::rename(con_up_t9_p16, "query" = con_up_t9_p16)
+con_up_t9_p16 <- left_join(con_up_t9_p16, egg, by="query")
+write_xlsx(con_up_t9_p16, "up_t9_p16.xlsx")
+
+con_down_t9_p16 <- rownames(down_t9_p16)
+con_down_t9_p16 <- gsub("cds.", "", con_down_t9_p16)
+con_down_t9_p16 <- as.data.frame(con_down_t9_p16)
+con_down_t9_p16 <- dplyr::rename(con_down_t9_p16, "query" = con_down_t9_p16)
+con_down_t9_p16 <- left_join(con_down_t9_p16, egg, by="query")
+write_xlsx(con_down_t9_p16, "down_t9_p16.xlsx")
+
+#_______________________________________________________________________________
+
+con_up_t9_p24 <- rownames(up_t9_p24)
+con_up_t9_p24 <- gsub("cds.", "", con_up_t9_p24)
+con_up_t9_p24 <- as.data.frame(con_up_t9_p24)
+con_up_t9_p24 <- dplyr::rename(con_up_t9_p24, "query" = con_up_t9_p24)
+con_up_t9_p24 <- left_join(con_up_t9_p24, egg, by="query")
+write_xlsx(con_up_t9_p24, "up_t9_p24.xlsx")
+
+con_down_t9_p24 <- rownames(down_t9_p24)
+con_down_t9_p24 <- gsub("cds.", "", con_down_t9_p24)
+con_down_t9_p24 <- as.data.frame(con_down_t9_p24)
+con_down_t9_p24 <- dplyr::rename(con_down_t9_p24, "query" = con_down_t9_p24)
+con_down_t9_p24 <- left_join(con_down_t9_p24, egg, by="query")
+write_xlsx(con_down_t9_p24, "down_t9_p24.xlsx")
+
+#_______________________________________________________________________________
+
+con_up_t13_p16 <- rownames(up_t13_p16)
+con_up_t13_p16 <- gsub("cds.", "", con_up_t13_p16)
+con_up_t13_p16 <- as.data.frame(con_up_t13_p16)
+con_up_t13_p16 <- dplyr::rename(con_up_t13_p16, "query" = con_up_t13_p16)
+con_up_t13_p16 <- left_join(con_up_t13_p16, egg, by="query")
+write_xlsx(con_up_t13_p16, "up_t13_p16.xlsx")
+
+con_down_t13_p16 <- rownames(down_t13_p16)
+con_down_t13_p16 <- gsub("cds.", "", con_down_t13_p16)
+con_down_t13_p16 <- as.data.frame(con_down_t13_p16)
+con_down_t13_p16 <- dplyr::rename(con_down_t13_p16, "query" = con_down_t13_p16)
+con_down_t13_p16 <- left_join(con_down_t13_p16, egg, by="query")
+write_xlsx(con_down_t13_p16, "down_t13_p16.xlsx")
+
+#_______________________________________________________________________________
+
+con_up_t13_p24 <- rownames(up_t13_p24)
+con_up_t13_p24 <- gsub("cds.", "", con_up_t13_p24)
+con_up_t13_p24 <- as.data.frame(con_up_t13_p24)
+con_up_t13_p24 <- dplyr::rename(con_up_t13_p24, "query" = con_up_t13_p24)
+con_up_t13_p24 <- left_join(con_up_t13_p24, egg, by="query")
+write_xlsx(con_up_t13_p24, "up_t13_p24.xlsx")
+
+con_down_t13_p24 <- rownames(down_t13_p24)
+con_down_t13_p24 <- gsub("cds.", "", con_down_t13_p24)
+con_down_t13_p24 <- as.data.frame(con_down_t13_p24)
+con_down_t13_p24 <- dplyr::rename(con_down_t13_p24, "query" = con_down_t13_p24)
+con_down_t13_p24 <- left_join(con_down_t13_p24, egg, by="query")
+write_xlsx(con_down_t13_p24, "down_t13_p24.xlsx")
+
+#_______________________________________________________________________________
+
+```

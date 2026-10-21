@@ -1,0 +1,142 @@
+---
+title: "WP2 Growthrates"
+author: "Jakob Giesler"
+date: "3/15/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<br>
+**1. Housekeeping**
+```{r housekeeping, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+library(tidyverse)
+library(readxl)
+library(growthrates)
+library(multcompView)
+library(ggthemes)
+
+setwd("/PATH")
+
+df <- read_excel("PANGAEA_GROWTHRATE_DATA")
+df <- df[,c(2,3,5:7,15)]
+```
+
+<br>
+**2. Calculation of specific growth rates**
+```{r calculation, message=FALSE, warning=FALSE}
+df$start <- 1500 #entering start density
+df$spec_growth <- ((log(df$cells_per_ml)-log(df$start))/df$harvest_day) #calculate growth rates
+df <- dplyr::group_by(df, temp, light, bac)
+df <- dplyr::mutate(df, mean_r = mean(spec_growth), sd_r = sd(spec_growth)) #mean and sd
+df$temp <- as.factor(df$temp)
+df$light <- as.factor(df$light)
+```
+
+<br>
+**3. Plotting growth rates**
+```{r plotting, message=FALSE, warning=FALSE}
+p1 <- df %>% ggplot(aes(light, mean_r, fill = bac))+
+  geom_bar(stat = "identity", color = "black", width = 0.5, position=position_dodge())+
+  geom_errorbar(aes(ymin=mean_r-sd_r, ymax=mean_r+sd_r), width=.2,
+                position=position_dodge(.5))+
+  facet_grid(~temp)+
+  scale_fill_brewer(palette="Paired")+
+  theme_light()
+p1
+#ggsave("growth.eps", p1, device = "eps", units = "cm", width = 10, height = 10, dpi300)
+
+p2 <- df %>% ggplot(aes(light, spec_growth, fill = bac))+
+  geom_boxplot()+
+  facet_grid(~temp)+
+  scale_fill_brewer(palette="Paired")+
+   labs(x="Photoperiod (h)", y="Specific growth rate µ (day^-1)")+
+ # theme_light()+
+    theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+p2
+
+ggsave("growth_boxplot.eps", p2, device = "eps", units = "cm", width = 10, height = 10, dpi=300)
+
+```
+<br>
+**4. statistics**
+```{r statistics, message=FALSE, warning=FALSE}
+
+str(df)
+
+#define factors
+df$bac <- as.factor(df$bac)
+df$temp <- as.factor(df$temp)
+df$light <- as.factor(df$light)
+
+#formulate the model
+m1 <- aov(data = df, spec_growth~bac*temp*light,
+            contrasts = list(temperature="contr.sum", daylength="contr.sum", bacteria="contr.sum")) 
+
+#check assumptions
+plot(m1)
+hist(resid(m1))
+
+#call for the output
+summary(m1)
+t1 <- TukeyHSD(m1)
+print(t1)
+
+library(dplyr)
+library(emmeans)
+library(effectsize)
+
+# Subset data by bacterial condition
+df_axenic <- df %>% filter(bac == "ax")
+df_xenic <- df %>% filter(bac == "xe")
+
+# Fit models separately for axenic and xenic
+m_axenic <- aov(spec_growth ~ temp * light, data = df_axenic)
+m_xenic <- aov(spec_growth ~ temp * light, data = df_xenic)
+
+# Estimated marginal means for temp and light within each group
+em_temp_axenic <- emmeans(m_axenic, ~ temp)
+em_temp_xenic <- emmeans(m_xenic, ~ temp)
+em_light_axenic <- emmeans(m_axenic, ~ light)
+em_light_xenic <- emmeans(m_xenic, ~ light)
+
+# Calculate effect sizes (Cohen's d) for temp contrasts
+eff_temp_axenic <- eff_size(em_temp_axenic, sigma = sigma(m_axenic), edf = df.residual(m_axenic))
+eff_temp_xenic <- eff_size(em_temp_xenic, sigma = sigma(m_xenic), edf = df.residual(m_xenic))
+
+# Calculate effect sizes (Cohen's d) for light contrasts
+eff_light_axenic <- eff_size(em_light_axenic, sigma = sigma(m_axenic), edf = df.residual(m_axenic))
+eff_light_xenic <- eff_size(em_light_xenic, sigma = sigma(m_xenic), edf = df.residual(m_xenic))
+
+# Convert to data frames for easier comparison
+df_eff_sizes <- bind_rows(
+  as.data.frame(eff_temp_axenic) %>% mutate(factor = "Temperature", condition = "Axenic"),
+  as.data.frame(eff_temp_xenic) %>% mutate(factor = "Temperature", condition = "Xenic"),
+  as.data.frame(eff_light_axenic) %>% mutate(factor = "Light", condition = "Axenic"),
+  as.data.frame(eff_light_xenic) %>% mutate(factor = "Light", condition = "Xenic")
+)
+
+# Select and print relevant columns: factor, condition, effect size (effect.size)
+t1<- df_eff_sizes %>%
+  select(factor, condition, effect.size, lower.CL, upper.CL) %>%
+  print()
+
+library(writexl)
+write_xlsx(t1, "effect_sizes.xlsx")
+
+```
+
+<br>
+**5. Log2 ratio calculation and plotting**
+
+```{r Log2 ratio, message=FALSE, warning=FALSE}
+
+df_log <- df
+df_log <- spread(df_log, bac, mean_r)
+
+```

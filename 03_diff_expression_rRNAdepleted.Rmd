@@ -1,0 +1,102 @@
+---
+title: "WP2 - mRNA differential expression analysis (rRNA-depleted libraries)"
+author: "Jakob Giesler"
+date: "3/12/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<br>
+**1. load packages**
+```{r load packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(BiocManager)
+library(DESeq2)
+library(knitr)
+library(readxl)
+library(writexl)
+library(ggthemes)
+```
+
+<br>
+**2. set up script (clean environment, set working directory, set global options)**
+```{r housekeeping, message=FALSE, warning=FALSE}
+rm(list = ls())
+setwd("/PATH")
+```
+
+<br>
+**3. create gene count matrix**
+```{r matrix, message=FALSE, warning=FALSE}
+file_list <- list.files("cleaned_bac_counts/", pattern = "cleaned.txt$", full.names = TRUE)
+
+##Merging the Files into a single data frames
+#Format Names
+GeneID <- read.delim("cleaned_bac_counts/01_WP2-RNA-1-bac_S1.counts_cleaned.txt", header=TRUE)
+GeneID <- GeneID$Geneid
+GeneID <- as.data.frame(GeneID)
+
+#bind the second column from each file into one file, make the rownames the Gene_ID
+df <- do.call(cbind,lapply(file_list,function(fn)read.delim(fn,header=TRUE)[,7]))
+rownames(df) <- GeneID$GeneID
+df <- as.data.frame(df)
+
+#make the colnames according to sample names, reformat the names
+temp = as.data.frame(list.files("cleaned_bac_counts/", pattern="*"))
+colnames(temp) <- 'FileName'
+
+#set sample names 
+temp$SampleName <- sub("\\..*$", "", temp$FileName)
+names <- temp
+colnames(df) <- names$SampleName
+
+#create matrix
+count_mat <- as.matrix(df)
+
+#export raw matrix
+write.csv(
+  count_mat,
+  file = "bac_raw_matrix_before_DESEQ.csv",
+  row.names = TRUE
+)
+
+```
+
+<br>
+**4. create meta file**
+```{r sample-info,  message=FALSE, warning=FALSE}
+sample_info <- read.delim("DE_bac_meta.txt")
+df_rownames <- sample_info$Sample
+rownames(sample_info) <- df_rownames
+sample_info <- sample_info[,2:6]
+```
+
+<br>
+**6. create DEseq2 object (via DESeqDataSet)**
+```{r deseq,  message=FALSE, warning=FALSE}
+
+# one object containing all data
+dds <- DESeqDataSetFromMatrix(countData = count_mat,
+                              colData = sample_info,
+                              design= ~ Treat)
+
+#remove rows with low read counts
+dds  <- dds[rowSums(counts(dds))>10]
+
+#group=factor(sample_info$Treat)
+#design(dds) = ~ group
+dds = DESeq(dds, test = "LRT", reduced = ~ 1)
+res=results(dds)
+vsd <- vst(dds, blind = FALSE)
+normalized_counts <- assay(vsd)
+sig_genes <- rownames(res)[which(res$padj < 0.05 & !is.na(res$padj))] # Filter significant genes (adjust the threshold as needed)
+
+normalized_counts <- normalized_counts[rownames(normalized_counts) %in% sig_genes,]
+normalized_counts_df <- as.data.frame(normalized_counts)
+normalized_counts_df <- tibble::rownames_to_column(normalized_counts_df, var = "Gene_ID")
+write.table(normalized_counts_df, file = "DE_vst_bacteria.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+```

@@ -1,0 +1,1057 @@
+---
+title: "Host–microbiome co-expression: cluster analysis"
+author: "Jakob Giesler"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+options(stringsAsFactors = FALSE)
+```
+
+# Overview
+
+This document reproduces the co-expression analysis between diatom (host) genes
+and bacterial (microbiome) genes:
+
+1. **Choosing k**: elbow method for the number of k-means clusters.
+2. **k-means clustering** of z-scored, differentially expressed host and bacterial genes,
+   using the published cluster assignments.
+3. **Centroid correlation and dendrogram**: host–microbiome cluster associations
+   and hierarchical ordering of clusters.
+4. **Global host–microbiome network**.
+5. **Module expression profiles**: host and bacterial clusters grouped into co-expression modules.
+6. **Functional characterisation**: COG composition heatmap and COG enrichment of bacterial clusters.
+7. **Taxonomic composition** of bacterial clusters.
+8. **PFAM odds ratios** across bacterial clusters.
+9. **Export** of gene-level cluster tables for manual exploration.
+
+## Repository layout
+
+```
+.
+├── host_microbiome_coexpression.Rmd
+├── data/      # input files (see list below)
+└── output/    # figures and tables written by this document
+```
+
+Input files expected in `data/`:
+
+| File | Content | Used in |
+|---|---|---|
+| `DE_vst_diatom_enrichment.txt` | VST counts, DE diatom genes in COG categories differing between axenic and xenic cultures | 1, 2 |
+| `DE_vst_bacteria.txt` | VST counts, DE bacterial genes | 1, 2 |
+| `DE_meta_combined.txt` | Sample metadata (columns `Sample`, `Treat`) | 2, 5 |
+| `explore_bac_new.xlsx` | Published cluster assignment of bacterial genes (`Gene_ID`, `cid`) | 2 |
+| `explore_euk.xlsx` | Published cluster assignment of diatom genes (`Gene_ID`, `cid`) | 2 |
+| `global_network_pos.xlsx`, `global_network_neg.xlsx` | Diatom (`H_*`, rows) × bacteria (`M_*`, columns) matrices with the number of positive / negative correlations; only nodes with at least one edge are listed | 4 |
+| `Bac_meta_cleaned.xlsx` | eggNOG annotation of bacterial genes (columns `query`, `COG_category`) | 6, 9 |
+| `cog_categories.xlsx` | COG letter → process lookup (columns `COG_category`, `process`) | 6 |
+| `signif_processes.xlsx` | eggNOG annotation of diatom genes (columns `query`, `COG_category`) | 6, 9 |
+| `genes_class.xlsx` | Bacterial genes with cluster ID (`cid.x`), `Class` and `COG_category` | 7 |
+| `pfams_odds_upset.csv` | PFAM counts per bacterial cluster with Fisher odds ratios (`;`-separated) | 8 |
+
+# Packages and paths
+
+```{r packages}
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(reshape2)
+library(qualpalr)
+library(igraph)
+library(UpSetR)
+```
+
+```{r paths}
+data_dir <- "data"
+out_dir  <- "output"
+dir.create(out_dir, showWarnings = FALSE)
+
+in_file  <- function(...) file.path(data_dir, ...)
+out_file <- function(...) file.path(out_dir, ...)
+```
+
+# 1. Choosing the number of clusters (elbow method)
+
+k-means is run 100 times for each k = 1–30 on the z-scored diatom genes, and the
+total within-cluster sum of squares is plotted per k.
+
+```{r elbow-function}
+run_elbow <- function(mat, k_max = 30, n_rep = 100) {
+  expand_grid(rep = seq_len(n_rep), k = seq_len(k_max)) %>%
+    mutate(error = map_dbl(k, ~ sum(kmeans(mat, centers = .x)$withinss)))
+}
+```
+
+```{r elbow-diatom, cache=TRUE}
+dia_elbow_mat <- read.delim(in_file("DE_vst_diatom_enrichment.txt"), row.names = 1)
+dia_elbow_mat <- t(scale(t(dia_elbow_mat)))
+
+elbow_dia <- run_elbow(dia_elbow_mat)
+
+p_elbow_dia <- ggplot(elbow_dia, aes(x = k, y = error, group = k)) +
+  geom_jitter(alpha = 0.1, size = 0.5) +
+  geom_violin() +
+  labs(title = "Elbow plot: diatom genes", y = "Total within-cluster SS")
+p_elbow_dia
+
+ggsave(out_file("num_clusters.pdf"), p_elbow_dia, width = 7, height = 7)
+```
+
+Optimal k for the diatom genes: not more than 11.
+
+The same procedure for the bacterial genes (k = 16 used below) is provided here
+but not evaluated by default because it is slow:
+
+```{r elbow-bacteria, eval=FALSE}
+bac_elbow_mat <- read.delim(in_file("DE_vst_bacteria.txt"), row.names = 1)
+bac_elbow_mat <- t(scale(t(bac_elbow_mat)))
+
+elbow_bac <- run_elbow(bac_elbow_mat)
+
+ggplot(elbow_bac, aes(x = k, y = error, group = k)) +
+  geom_jitter(alpha = 0.1, size = 0.5) +
+  geom_violin() +
+  labs(title = "Elbow plot: bacterial genes", y = "Total within-cluster SS")
+```
+
+# 2. k-means clustering of host and bacterial genes
+
+## Data import and sample name harmonisation
+
+```{r import}
+# DE genes belonging to bacteria
+bac_raw <- read.delim(in_file("DE_vst_bacteria.txt"), row.names = 1, check.names = FALSE)
+# Diatom genes in COG categories that differed between axenic and xenic cultures
+euk_raw <- read.delim(in_file("DE_vst_diatom_enrichment.txt"), row.names = 1, check.names = FALSE)
+
+meta <- read.delim(in_file("DE_meta_combined.txt"))
+sample_order <- meta$Sample
+
+# Replace "-" and "_" by "." and drop everything after the fourth "."
+clean_names <- function(x) {
+  x <- gsub("[-_]", ".", x)
+  sub("^(([^.]*[.]){3}[^.]*)[.].*$", "\\1", x)
+}
+colnames(bac_raw) <- clean_names(colnames(bac_raw))
+colnames(euk_raw) <- clean_names(colnames(euk_raw))
+
+# Reorder columns and compute z-scores per gene
+bac_z <- t(scale(t(dplyr::select(bac_raw, all_of(sample_order)))))
+euk_z <- t(scale(t(dplyr::select(euk_raw, all_of(sample_order)))))
+```
+
+## Clustering
+
+```{r kmeans}
+k_bac <- 16  # determined with the elbow method
+k_dia <- 11
+
+set.seed(124)
+
+# Bacterial genes
+kmeans_bac <- kmeans(bac_z, centers = k_bac, iter.max = 50)
+bac_genes <- data.frame(bac_z)
+bac_genes$cid <- paste("b", kmeans_bac$cluster, sep = "_")
+bac_genes$Gene_ID <- rownames(bac_genes)
+bac_centroids <- kmeans_bac$centers
+
+# Host genes
+kmeans_euk <- kmeans(euk_z, centers = k_dia, iter.max = 50)
+euk_genes <- data.frame(euk_z)
+euk_genes$cid <- paste("h", kmeans_euk$cluster, sep = "_")
+euk_genes$Gene_ID <- rownames(euk_genes)
+euk_centroids <- kmeans_euk$centers
+```
+
+## Published cluster assignments
+
+k-means starts from random centres, so cluster membership and numbering can
+differ between R versions and machines even with the same seed. To reproduce the
+published results exactly, the cluster assignments used in the manuscript are
+read from `explore_bac_new.xlsx` and `explore_euk.xlsx`. The tables below compare
+them with the k-means run above (a reproduced clustering shows one non-zero cell
+per row and column, possibly with different numbering).
+
+```{r published-clusters}
+use_published_clusters <- TRUE
+
+pub_bac <- read_xlsx(in_file("explore_bac_new.xlsx")) %>%
+  dplyr::filter(!is.na(cid)) %>%
+  dplyr::select(Gene_ID, cid)
+pub_euk <- read_xlsx(in_file("explore_euk.xlsx")) %>%
+  dplyr::filter(!is.na(cid)) %>%
+  dplyr::select(Gene_ID, cid)
+
+pub_bac_cid <- pub_bac$cid[match(bac_genes$Gene_ID, pub_bac$Gene_ID)]
+pub_euk_cid <- pub_euk$cid[match(euk_genes$Gene_ID, pub_euk$Gene_ID)]
+
+table(kmeans = bac_genes$cid, published = pub_bac_cid, useNA = "ifany")
+table(kmeans = euk_genes$cid, published = pub_euk_cid, useNA = "ifany")
+
+if (use_published_clusters) {
+  if (anyNA(pub_bac_cid)) stop(sum(is.na(pub_bac_cid)), " bacterial genes have no published cluster")
+  if (anyNA(pub_euk_cid)) stop(sum(is.na(pub_euk_cid)), " diatom genes have no published cluster")
+
+  bac_genes$cid <- pub_bac_cid
+  euk_genes$cid <- pub_euk_cid
+
+  # Centroids = mean z-score per cluster (identical to k-means centres at convergence)
+  cluster_centroids <- function(z, cid, prefix, k) {
+    cen <- t(sapply(paste(prefix, seq_len(k), sep = "_"),
+                    function(id) colMeans(z[cid == id, , drop = FALSE])))
+    rownames(cen) <- as.character(seq_len(k))
+    cen
+  }
+  bac_centroids <- cluster_centroids(bac_z, bac_genes$cid, "b", k_bac)
+  euk_centroids <- cluster_centroids(euk_z, euk_genes$cid, "h", k_dia)
+}
+```
+
+```{r centroid-plots}
+matplot(t(bac_centroids), type = "l", col = 1:k_bac, lty = 1:k_bac,
+        xlab = "Samples", ylab = "Expression", main = "Bacterial Gene Clusters")
+legend("topright", legend = 1:k_bac, col = 1:k_bac, lty = 1:k_bac, cex = 0.7, title = "Cluster")
+
+matplot(t(euk_centroids), type = "l", col = 1:k_dia, lty = 1:k_dia,
+        xlab = "Samples", ylab = "Expression", main = "Host Gene Clusters")
+legend("topright", legend = 1:k_dia, col = 1:k_dia, lty = 1:k_dia, cex = 0.7, title = "Cluster")
+```
+
+## Cluster tables for the module plots
+
+The module plots (section 5) use gene and centroid tables in which bacterial
+clusters are labelled `m_*` (`m_9` = `b_9`). They are built here from the
+clustering above.
+
+```{r module-tables}
+mod_bac_genes <- bac_genes %>%
+  setNames(c(sample_order, "cid", "Gene_ID")) %>%
+  mutate(cid = sub("^b_", "m_", cid))
+mod_euk_genes <- euk_genes %>%
+  setNames(c(sample_order, "cid", "Gene_ID"))
+
+mod_bac_centroids <- as.data.frame(bac_centroids) %>%
+  mutate(cid = paste0("m_", rownames(bac_centroids)))
+mod_euk_centroids <- as.data.frame(euk_centroids) %>%
+  mutate(cid = paste0("h_", rownames(euk_centroids)))
+
+# write.table(mod_bac_genes, out_file("bac_clust_genes.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
+# write.table(mod_euk_genes, out_file("euk_clust_genes.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
+# write.table(mod_bac_centroids, out_file("bac_centroids.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
+# write.table(mod_euk_centroids, out_file("euk_centroids.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+# 3. Centroid correlation and dendrogram
+
+## Mean expression per cluster and sample
+
+```{r cluster-means}
+cluster_means <- function(genes) {
+  genes %>%
+    dplyr::select(-Gene_ID) %>%
+    pivot_longer(cols = 1:16, names_to = "Treatment", values_to = "Expression") %>%
+    group_by(Treatment, cid) %>%
+    summarise(Expression = mean(Expression), .groups = "drop") %>%
+    pivot_wider(names_from = cid, values_from = Expression)
+}
+
+merged_data <- inner_join(cluster_means(bac_genes), cluster_means(euk_genes), by = "Treatment")
+```
+
+## Pairwise Pearson correlations
+
+```{r correlations}
+all_columns <- colnames(merged_data)[-1]
+
+cor_matrix <- matrix(NA, nrow = length(all_columns), ncol = length(all_columns),
+                     dimnames = list(all_columns, all_columns))
+p_matrix <- cor_matrix
+
+for (i in seq_along(all_columns)) {
+  for (j in i:length(all_columns)) {
+    test_result <- cor.test(merged_data[[all_columns[i]]], merged_data[[all_columns[j]]],
+                            use = "complete.obs")
+    cor_matrix[i, j] <- cor_matrix[j, i] <- test_result$estimate
+    p_matrix[i, j]   <- p_matrix[j, i]   <- test_result$p.value
+  }
+}
+```
+
+## Cytoscape network input
+
+Bacteria–host cluster pairs with p ≤ 0.05 and |r| ≥ 0.8.
+
+```{r cytoscape}
+cyto_matrix <- cor_matrix
+cyto_matrix[p_matrix > 0.05] <- NA
+
+cyto <- data.frame(cyto_matrix)
+cyto <- cyto[!grepl("^h", rownames(cyto)), ]
+cyto <- cyto[, !grepl("^b", colnames(cyto))]
+cyto <- melt(as.matrix(cyto), varnames = c("Bac", "Diatom"), value.name = "Correlation")
+cyto <- dplyr::filter(cyto, Correlation <= -0.8 | Correlation >= 0.8)
+cyto
+
+# write.table(cyto, out_file("cyto_new.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+## Hierarchical clustering of clusters
+
+```{r dendrogram, fig.width=12}
+dist_matrix <- as.dist(1 - abs(cor_matrix))
+hc <- hclust(dist_matrix, method = "average")
+
+# postscript(out_file("dendrogram_new.eps"), width = 10, height = 5, paper = "special", horizontal = FALSE)
+plot(hc, main = "Dendrogram of Hierarchical Clustering", xlab = "Clusters", sub = "",
+     cex = 0.9, hang = -1)
+# dev.off()
+
+# Order used for the heatmap in section 6
+cluster_order <- hc$labels[hc$order]
+```
+
+# 4. Global host–microbiome network
+
+Diatom (rows) × bacterial (columns) matrices of positive and negative correlations.
+Edge width scales with the absolute value, node size with degree. Host node `H_M`
+is excluded from the network.
+
+## Edges and nodes
+
+```{r network-import}
+set.seed(21)
+
+# Positive matrix
+df_pos <- as.data.frame(read_xlsx(in_file("global_network_pos.xlsx")))
+rownames(df_pos) <- df_pos[[1]]
+df_pos[[1]] <- NULL
+df_pos <- df_pos[!(rownames(df_pos) == "H_M"), ]
+mat_pos <- apply(df_pos, 2, as.numeric)
+
+# Negative matrix
+df_neg <- as.data.frame(read_xlsx(in_file("global_network_neg.xlsx")))
+rownames(df_neg) <- df_neg[[1]]
+df_neg[[1]] <- NULL
+df_neg <- df_neg[!(rownames(df_neg) == "H_M"), ]
+mat_neg <- apply(df_neg, 2, as.numeric)
+
+cat("Positive matrix:", nrow(df_pos), "x", ncol(df_pos), "\n")
+cat("Negative matrix:", nrow(df_neg), "x", ncol(df_neg), "\n")
+
+# Edge lists (absolute values for thickness)
+edges_pos <- expand.grid(diatom = rownames(df_pos), bacteria = colnames(df_pos),
+                         stringsAsFactors = FALSE)
+edges_pos$count <- as.vector(mat_pos)
+edges_pos$type  <- "positive"
+edges_pos <- edges_pos[!is.na(edges_pos$count) & edges_pos$count > 0, ]
+
+edges_neg <- expand.grid(diatom = rownames(df_neg), bacteria = colnames(df_neg),
+                         stringsAsFactors = FALSE)
+edges_neg$count_raw <- as.vector(mat_neg)
+edges_neg <- edges_neg[!is.na(edges_neg$count_raw) & edges_neg$count_raw < 0, ]
+edges_neg$count <- abs(edges_neg$count_raw)
+edges_neg$type  <- "negative"
+edges_neg$count_raw <- NULL
+
+edges_all <- rbind(edges_pos, edges_neg)
+cat("Positive edges:", nrow(edges_pos), "\n")
+cat("Negative edges:", nrow(edges_neg), "\n")
+cat("Total edges:", nrow(edges_all), "\n")
+
+# Nodes and graph
+nodes_diatom   <- data.frame(name = rownames(df_pos), type = "diatom", stringsAsFactors = FALSE)
+nodes_bacteria <- data.frame(name = colnames(df_pos), type = "bacteria", stringsAsFactors = FALSE)
+nodes <- rbind(nodes_diatom, nodes_bacteria)
+
+g_full <- graph_from_data_frame(
+  d = edges_all[, c("diatom", "bacteria", "count", "type")],
+  vertices = nodes,
+  directed = FALSE
+)
+
+# Remove isolated nodes
+deg_full <- degree(g_full)
+isolates <- V(g_full)[deg_full == 0]
+if (length(isolates) > 0) {
+  cat("Removing", length(isolates), "isolated nodes\n")
+  g <- delete_vertices(g_full, isolates)
+} else {
+  g <- g_full
+}
+```
+
+## Styling and legends
+
+```{r network-style}
+# Edge styling
+edge_width_range <- c(0.6, 10)
+counts <- E(g)$count
+count_min <- min(counts)
+count_max <- max(counts)
+
+if (count_max == count_min) {
+  E(g)$width <- mean(edge_width_range)
+} else {
+  E(g)$width <- edge_width_range[1] +
+    (counts - count_min) * (edge_width_range[2] - edge_width_range[1]) /
+    (count_max - count_min)
+}
+
+E(g)$color <- ifelse(E(g)$type == "positive",
+                     adjustcolor("darkblue", alpha.f = 0.7),
+                     adjustcolor("darkred",  alpha.f = 0.7))
+E(g)$curved <- 0.12
+
+# Node styling
+V(g)$color <- ifelse(V(g)$type == "diatom", "#90EE90", "#FFA500")
+V(g)$shape <- "circle"
+
+deg <- degree(g)
+deg_min <- min(deg)
+deg_max <- max(deg)
+node_size_range <- c(4, 18)
+
+if (deg_max == deg_min) {
+  V(g)$size <- mean(node_size_range)
+} else {
+  V(g)$size <- node_size_range[1] +
+    (deg - deg_min) * (node_size_range[2] - node_size_range[1]) /
+    (deg_max - deg_min)
+}
+
+V(g)$label.cex <- 0.6
+V(g)$label.color <- "black"
+
+# Legend helpers
+draw_edge_legend <- function(counts_vec, edge_width_range, xfrac = 0.02, y_bottomfrac = 0.15) {
+  rep_counts <- unique(round(c(min(counts_vec), median(counts_vec), max(counts_vec)), 1))
+  count_min <- min(counts_vec); count_max <- max(counts_vec)
+  rep_widths <- edge_width_range[1] + (rep_counts - count_min) *
+    (edge_width_range[2] - edge_width_range[1]) / (count_max - count_min)
+
+  u <- par("usr")
+  x_left  <- u[1] + xfrac * (u[2] - u[1])
+  x_right <- x_left + 0.1 * (u[2] - u[1])
+  y_start <- u[3] + y_bottomfrac * (u[4] - u[3])
+  y_step  <- 0.035 * (u[4] - u[3])
+
+  text(x = x_left, y = y_start + y_step * 2, labels = "Count → width", adj = 0, cex = 0.8)
+  for (i in seq_along(rep_counts)) {
+    y_i <- y_start + (i - 1) * y_step
+    segments(x_left, y_i, x_right, y_i, lwd = rep_widths[i], col = "darkblue", lend = "round")
+    text(x = x_right + 0.015 * (u[2] - u[1]), y = y_i, labels = rep_counts[i], adj = 0, cex = 0.75)
+  }
+}
+
+draw_edge_type_legend <- function(xfrac = 0.75, y_bottomfrac = 0.15) {
+  u <- par("usr")
+  x_pos <- u[1] + xfrac * (u[2] - u[1])
+  y_pos <- u[3] + y_bottomfrac * (u[4] - u[3])
+  legend(x_pos, y_pos,
+         legend = c("Positive correlation", "Negative correlation"),
+         col = c("darkblue", "darkred"), lwd = 4, cex = 0.9, bty = "n")
+}
+
+draw_node_legend <- function(deg_vec, size_vec, xfrac = 0.02, y_topfrac = 0.85) {
+  dmin <- min(deg_vec)
+  dmax <- max(deg_vec)
+
+  # Quantile-based representative degrees that exist in the data
+  deg_breaks <- quantile(deg_vec, probs = c(0.25, 0.75), na.rm = TRUE)
+  deg_vals <- c(floor(dmin), round(deg_breaks[1]), ceiling(dmax))
+  deg_vals <- unique(deg_vals[deg_vals >= dmin & deg_vals <= dmax])
+
+  u <- par("usr")
+  x_center <- u[1] + xfrac * (u[2] - u[1])
+  y_top  <- u[3] + y_topfrac * (u[4] - u[3])
+  y_step <- 0.04 * (u[4] - u[3])
+
+  text(x_center, y_top + y_step, "Degree → size", adj = c(0, 0.5), cex = 0.8)
+
+  for (i in seq_along(deg_vals)) {
+    d <- deg_vals[i]
+    idx <- which(deg_vec == d)[1]
+    if (is.na(idx)) next
+    s <- size_vec[idx]
+    y_i <- y_top - i * y_step
+    # cex = size / 3.5 matches igraph vertex.size
+    points(x_center, y_i, pch = 21, cex = s / 3.5, bg = "grey70", col = "black", lwd = 0.5)
+    text(x_center + 0.035 * (u[2] - u[1]), y_i, labels = d, adj = 0, cex = 0.75, font = 2)
+  }
+}
+
+# Network plot with legends
+plot_network <- function(layout) {
+  plot(g, layout = layout, vertex.frame.color = NA,
+       main = "Diatom–Bacterial Network (blue=+, red=−; size=degree)", margin = 0.12)
+  draw_edge_legend(counts, edge_width_range)
+  draw_edge_type_legend()
+  draw_node_legend(deg, V(g)$size)
+}
+```
+
+## Layouts
+
+```{r network-fr, fig.width=12, fig.height=9}
+# Fruchterman-Reingold
+set.seed(123)
+layout_fr <- layout_with_fr(g, niter = 2000)
+cairo_pdf(out_file("network_dual_fr.pdf"), width = 12, height = 9)
+plot_network(layout_fr)
+dev.off()
+plot_network(layout_fr)
+```
+
+```{r network-kk, fig.width=12, fig.height=9}
+# Kamada-Kawai
+set.seed(42)
+layout_kk <- layout_with_kk(g)
+cairo_pdf(out_file("network_dual_kk.pdf"), width = 12, height = 9)
+plot_network(layout_kk)
+dev.off()
+plot_network(layout_kk)
+```
+
+```{r network-circular, fig.width=12, fig.height=9}
+# Grouped circular: diatoms on the left, bacteria on the right
+n_d <- sum(V(g)$type == "diatom")
+n_b <- sum(V(g)$type == "bacteria")
+angles_d <- seq(pi/2, 3*pi/2, length.out = n_d + 1)[-(n_d + 1)]
+angles_b <- seq(-pi/2, pi/2, length.out = n_b + 1)[-(n_b + 1)]
+coords <- matrix(NA, nrow = vcount(g), ncol = 2)
+coords[1:n_d, 1] <- cos(angles_d) * 1.2
+coords[1:n_d, 2] <- sin(angles_d) * 1.2
+coords[(n_d + 1):vcount(g), 1] <- cos(angles_b) * 1.2
+coords[(n_d + 1):vcount(g), 2] <- sin(angles_b) * 1.2
+
+cairo_pdf(out_file("network_dual_circular.pdf"), width = 12, height = 9)
+plot_network(coords)
+dev.off()
+plot_network(coords)
+```
+
+## Export for Cytoscape
+
+```{r network-export}
+edge_df <- data.frame(
+  source      = V(g)[head_of(g, E(g))]$name,
+  target      = V(g)[tail_of(g, E(g))]$name,
+  interaction = E(g)$type,
+  weight_abs  = E(g)$count,
+  stringsAsFactors = FALSE
+)
+write.csv(edge_df, out_file("network_edges_for_cytoscape.csv"), row.names = FALSE, quote = FALSE)
+
+node_df <- data.frame(
+  name      = V(g)$name,
+  type      = V(g)$type,
+  degree    = degree(g),
+  color_hex = V(g)$color,
+  size_plot = V(g)$size,
+  stringsAsFactors = FALSE
+)
+write.csv(node_df, out_file("network_nodes_for_cytoscape.csv"), row.names = FALSE, quote = FALSE)
+
+cat("Nodes:", vcount(g), "(green=diatom, orange=bacteria; size=degree)\n")
+cat("Total edges:", ecount(g), "(blue=positive, red=negative)\n")
+cat("Edge |count| range:", round(count_min, 1), "-", round(count_max, 1), "\n")
+cat("Node degree range:", round(deg_min, 1), "-", round(deg_max, 1), "\n")
+```
+
+# 5. Module expression profiles
+
+Host and bacterial clusters were grouped into modules based on the network and
+dendrogram above.
+
+```{r module-setup}
+meta_mod <- read.delim(in_file("DE_meta_combined.txt")) %>%
+  dplyr::rename(treatment = Sample)
+
+module_sample_order <- c("16.WP2.RNA.16", "17.WP2.RNA.17", "18.WP2.RNA.18", "19.WP2.RNA.19",
+                         "06.WP2.RNA.6",  "07.WP2.RNA.7",  "08.WP2.RNA.8",  "09.WP2.RNA.9",
+                         "01.WP2.RNA.1",  "02.WP2.RNA.2",  "03.WP2.RNA.3",  "04.WP2.RNA.4",
+                         "26.WP2.RNA.26", "27.WP2.RNA.27", "28.WP2.RNA.28", "29.WP2.RNA.29")
+treat_order <- c("D", "B", "A", "F")
+```
+
+```{r module-definitions}
+module_defs <- list(
+  module_1 = list(bac = "m_9",                                      euk = "h_6"),
+  module_2 = list(bac = c("m_3", "m_4", "m_7", "m_16"),             euk = c("h_4", "h_1")),
+  module_3 = list(bac = c("m_6", "m_10", "m_14"),                   euk = c("h_2", "h_10")),
+  module_4 = list(bac = c("m_1", "m_13"),                           euk = c("h_7", "h_9", "h_11")),
+  rest     = list(bac = c("m_12", "m_2", "m_11", "m_5", "m_15", "m_8"), euk = c("h_3", "h_5", "h_8"))
+)
+
+prepare_module <- function(def, name) {
+  genes <- bind_rows(
+    dplyr::filter(mod_bac_genes, cid %in% def$bac) %>% mutate(holo = "microbiome"),
+    dplyr::filter(mod_euk_genes, cid %in% def$euk) %>% mutate(holo = "host")
+  )
+  centroids <- bind_rows(
+    dplyr::filter(mod_bac_centroids, cid %in% def$bac) %>% mutate(holo = "microbiome"),
+    dplyr::filter(mod_euk_centroids, cid %in% def$euk) %>% mutate(holo = "host")
+  )
+
+  genes_long <- genes %>%
+    pivot_longer(cols = 1:16, names_to = "treatment", values_to = "expression") %>%
+    left_join(meta_mod, by = "treatment") %>%
+    group_by(Treat, Gene_ID) %>%
+    mutate(mean_gene = mean(expression), sd_gene = sd(expression)) %>%
+    ungroup() %>%
+    mutate(treatment = factor(treatment, levels = module_sample_order),
+           Treat     = factor(Treat, levels = treat_order),
+           mod       = name)
+
+  centroids_long <- centroids %>%
+    pivot_longer(cols = 1:16, names_to = "treatment", values_to = "centroid") %>%
+    left_join(meta_mod, by = "treatment") %>%
+    group_by(Treat, cid) %>%
+    mutate(mean_cen = mean(centroid), sd_cen = sd(centroid)) %>%
+    ungroup() %>%
+    mutate(treatment = factor(treatment, levels = module_sample_order),
+           Treat     = factor(Treat, levels = treat_order),
+           mod       = name)
+
+  list(genes = genes_long, centroids = centroids_long)
+}
+
+modules <- imap(module_defs, prepare_module)
+```
+
+## Individual modules
+
+```{r module-plot-function}
+# Standard module plot (used for modules 1, 3, 4 and rest)
+plot_module <- function(cen, n_col = NULL) {
+  p <- ggplot(cen, aes(x = Treat, y = mean_cen, col = cid, group = cid)) +
+    geom_point(position = position_dodge(0.1)) +
+    geom_smooth(method = "loess", se = TRUE, alpha = 0.3) +
+    geom_errorbar(aes(ymin = mean_cen - sd_cen, ymax = mean_cen + sd_cen), width = 0.5,
+                  position = position_dodge(0.1)) +
+    theme_light() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  if (!is.null(n_col)) {
+    clust_pal <- qualpal(n_col, colorspace = list(h = c(0, 360), s = c(0.3, 1), l = c(0.2, 0.8)))
+    p <- p + scale_color_manual(values = clust_pal$hex)
+  }
+  p
+}
+```
+
+### Module 1 (M9 & H6)
+
+```{r module1-plot}
+plot_module(modules$module_1$centroids)
+```
+
+### Module 2 (M3, M4, M7, M16 & H4, H1)
+
+```{r module2-plot}
+# As in the original script, treatments are not reordered for module 2
+module2_centroids <- modules$module_2$centroids %>% mutate(Treat = as.character(Treat))
+
+clust_pal <- qualpal(6, colorspace = list(h = c(0, 360), s = c(0.3, 1), l = c(0.2, 0.8)))
+
+module2_centroids %>%
+  ggplot(aes(x = Treat, y = mean_cen, col = cid, group = cid, shape = holo)) +
+  geom_point(position = position_dodge(0.1), size = 2) +
+  geom_smooth(method = "loess", se = FALSE, alpha = 0.3, lwd = 0.7) +
+  geom_errorbar(aes(ymin = mean_cen - sd_cen, ymax = mean_cen + sd_cen), width = 0.7,
+                position = position_dodge(0.1), lwd = 0.7) +
+  scale_color_manual(values = clust_pal$hex) +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Module 3 (M6, M10, M14 & H2, H10)
+
+```{r module3-plot}
+plot_module(modules$module_3$centroids, n_col = 5)
+```
+
+### Module 4 (M1, M13 & H7, H9, H11)
+
+```{r module4-plot}
+plot_module(modules$module_4$centroids, n_col = 5)
+```
+
+### Rest (M12, M2, M11, M5, M15, M8 & H3, H5, H8)
+
+```{r rest-plot}
+plot_module(modules$rest$centroids, n_col = 9)
+```
+
+## Modules 1–4 combined
+
+```{r modules-combined, fig.height=10}
+module_data <- bind_rows(map(modules, "centroids")) %>%
+  dplyr::filter(mod != "rest")
+# write.table(module_data, out_file("module_data.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
+
+clust_pal <- qualpal(18, colorspace = list(h = c(0, 360), s = c(0.3, 1), l = c(0.2, 0.8)))
+
+p_modules <- ggplot(module_data, aes(x = Treat, y = centroid, col = cid, group = cid)) +
+  geom_jitter(width = 0.1) +
+  geom_smooth(method = "loess", se = TRUE, alpha = 1) +
+  facet_grid(mod ~ ., scales = "free_x") +
+  scale_color_manual(values = clust_pal$hex) +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_modules
+# ggsave(out_file("modules_long.eps"), p_modules, device = "eps", units = "cm", width = 8, height = 15, dpi = 300)
+```
+
+```{r module2-detail}
+mod2 <- dplyr::filter(module_data, mod == "module_2")
+
+ggplot(mod2, aes(x = Treat, y = centroid, group = cid)) +
+  geom_jitter(aes(fill = cid), colour = "black", pch = 21, size = 2, width = 0.1) +
+  geom_smooth(aes(col = cid), method = "loess", se = TRUE) +
+  facet_grid(mod ~ ., scales = "free_x") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 6. Functional characterisation (COG categories)
+
+## Annotation
+
+```{r cog-annotation}
+cog       <- read_xlsx(in_file("cog_categories.xlsx"))     # columns: COG_category, process
+bac_annot <- read_xlsx(in_file("Bac_meta_cleaned.xlsx"))
+euk_annot <- read_xlsx(in_file("signif_processes.xlsx"))
+
+# Split multi-letter COG assignments into one row per letter and add the process
+split_cog <- function(dat) {
+  dat %>%
+    mutate(COG_category = strsplit(as.character(COG_category), "")) %>%
+    unnest(COG_category) %>%
+    left_join(cog, by = "COG_category")
+}
+
+# Bacteria
+bac_egg <- bac_genes %>%
+  dplyr::select(cid, Gene_ID) %>%
+  left_join(bac_annot %>% dplyr::rename(Gene_ID = query) %>% dplyr::select(Gene_ID, COG_category),
+            by = "Gene_ID") %>%
+  mutate(COG_category = ifelse(is.na(COG_category), "-", COG_category))
+bac_egg_split <- split_cog(bac_egg)
+
+# Host
+euk_egg <- euk_annot %>%
+  dplyr::rename(Gene_ID = query) %>%
+  dplyr::filter(Gene_ID %in% euk_genes$Gene_ID) %>%
+  left_join(dplyr::select(euk_genes, cid, Gene_ID), by = "Gene_ID")
+euk_egg_split <- split_cog(euk_egg)
+
+# COG categories significantly different between xenic and axenic diatoms
+allowed_letters <- c("M", "O", "W", "Q", "F", "I", "P", "A", "B", "J", "L")
+```
+
+## Relative COG composition per cluster
+
+```{r cog-composition}
+processes <- c(metab = "metabolism",
+               infor = "information_storage_processing",
+               cellu = "cellular_processes_signaling")
+
+# Counts and relative abundance of each COG letter per cluster.
+# Totals are computed before host clusters are restricted to `allowed_letters`.
+summarise_cog <- function(dat, restrict_host = FALSE) {
+  counts <- dat %>%
+    group_by(cid, COG_category) %>%
+    summarise(count = n(), .groups = "drop")
+  totals <- counts %>%
+    group_by(cid) %>%
+    summarise(total = sum(count), .groups = "drop")
+  if (restrict_host) {
+    counts <- dplyr::filter(counts, !(grepl("^h_", cid) & !COG_category %in% allowed_letters))
+  }
+  relative <- counts %>%
+    left_join(totals, by = "cid") %>%
+    mutate(relative_abundance = count / total) %>%
+    dplyr::select(cid, COG_category, relative_abundance)
+  list(total = totals, relative = relative)
+}
+
+bac_sum <- map(processes, ~ summarise_cog(dplyr::filter(bac_egg_split, process == .x)))
+euk_sum <- map(processes, ~ summarise_cog(dplyr::filter(euk_egg_split, process == .x),
+                                          restrict_host = TRUE))
+
+heat_df <- bind_rows(c(map(bac_sum, "relative"), map(euk_sum, "relative"))) %>%
+  left_join(cog, by = "COG_category")
+
+cluster_totals <- bind_rows(c(map(bac_sum, "total"), map(euk_sum, "total"))) %>%
+  group_by(cid) %>%
+  summarise(total = sum(total), .groups = "drop") %>%
+  dplyr::rename(Cluster_ID = cid)
+
+summary_df <- heat_df %>%
+  pivot_wider(names_from = cid, values_from = relative_abundance, values_fill = 0)
+colnames(summary_df)[-1:-2] <- paste0("Cluster_", colnames(summary_df)[-1:-2])
+
+long_df <- summary_df %>%
+  pivot_longer(cols = starts_with("Cluster_"), names_to = "Cluster_ID",
+               values_to = "Relative_Abundance") %>%
+  mutate(Cluster_ID = gsub("Cluster_", "", Cluster_ID)) %>%
+  left_join(cluster_totals, by = "Cluster_ID") %>%
+  dplyr::rename(Total_Genes = total) %>%
+  mutate(Cluster_ID = factor(Cluster_ID, levels = cluster_order)) %>%
+  arrange(Cluster_ID)
+```
+
+## COG enrichment of bacterial clusters
+
+Background: all bacteria-annotated genes in the reference transcriptome.
+Hypergeometric tests per cluster, COG letter and process; categories with fewer
+than 5 genes in a cluster are not tested.
+
+```{r cog-background}
+count_letters <- function(string) {
+  letters <- unlist(strsplit(toupper(string), ""))
+  letter_counts <- table(letters)
+  data.frame(letter = names(letter_counts), count = as.numeric(letter_counts),
+             stringsAsFactors = FALSE)
+}
+
+ref_counts <- bind_rows(lapply(bac_annot$COG_category, count_letters)) %>%
+  group_by(letter) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+ref_counts <- ref_counts[2:25, ] %>%               # remove not annotated symbol "-"
+  dplyr::rename(COG_category = letter) %>%
+  left_join(cog, by = "COG_category") %>%
+  group_by(process) %>%
+  mutate(rel_cog = count / sum(count), ref_sum = sum(count)) %>%
+  ungroup()
+```
+
+```{r cog-enrichment}
+egg <- left_join(bac_egg, dplyr::select(bac_genes, cid, Gene_ID), by = "Gene_ID")  # gives cid.x / cid.y
+bac_split <- split_cog(egg)
+
+cluster_bac <- bac_split %>%
+  group_by(cid.x, COG_category) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  dplyr::filter(COG_category != "-") %>%
+  left_join(ref_counts, by = "COG_category") %>%
+  dplyr::rename(count_ref = count, count_clust = Count) %>%
+  dplyr::select(cid.x, COG_category, count_clust, count_ref, process, ref_sum) %>%
+  group_by(cid.x, process) %>%
+  mutate(clust_sum = sum(count_clust)) %>%
+  ungroup()
+
+# Calculate enrichments
+cluster_bac <- cluster_bac %>%
+  mutate(pval_depleted = phyper(count_clust,     count_ref, ref_sum, clust_sum, lower.tail = TRUE),
+         pval_enriched = phyper(count_clust - 1, count_ref, ref_sum, clust_sum, lower.tail = FALSE))
+
+# cutoff processes with less than 5 genes
+cluster_bac$pval_depleted <- ifelse(cluster_bac$count_clust < 5, paste("NA"), cluster_bac$pval_depleted)
+cluster_bac$pval_enriched <- ifelse(cluster_bac$count_clust < 5, paste("NA"), cluster_bac$pval_enriched)
+
+enriched_bac_genes <- cluster_bac %>%
+  dplyr::filter(pval_enriched < 0.05) %>%
+  mutate(unique_tile = paste(cid.x, COG_category, sep = "_"))
+
+long_df <- long_df %>%
+  mutate(unique_tile = paste(Cluster_ID, COG_category, sep = "_")) %>%
+  left_join(dplyr::select(enriched_bac_genes, unique_tile, pval_enriched), by = "unique_tile") %>%
+  mutate(significant = ifelse(pval_enriched < 0.05, paste("*"), pval_enriched))
+```
+
+## Heatmap
+
+```{r cog-heatmap, fig.width=11, fig.height=5}
+genes_per_cluster <- bind_rows(dplyr::select(bac_egg_split, Gene_ID, cid),
+                               dplyr::select(euk_egg_split, Gene_ID, cid)) %>%
+  group_by(cid) %>%
+  summarise(Unique_Gene_Count = n_distinct(Gene_ID), .groups = "drop") %>%
+  mutate(cid = factor(cid, levels = cluster_order)) %>%
+  arrange(cid)
+
+p_heat <- ggplot(long_df, aes(x = Cluster_ID, y = COG_category, fill = Relative_Abundance)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(colors = c("lightblue", "yellow", "red"), name = "Relative Abundance") +
+  theme_minimal() +
+  labs(x = "Gene Cluster ID", y = "COG Category") +
+  facet_grid(process ~ ., scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        plot.margin = margin(t = 40, r = 20, b = 20, l = 20)) +
+  geom_text(data = genes_per_cluster,
+            aes(x = cid, y = max(as.numeric(factor(long_df$COG_category))) + 0.5,
+                label = Unique_Gene_Count),
+            inherit.aes = FALSE, hjust = 0.5, size = 3, angle = 90, nudge_y = 1.5) +
+  geom_text(aes(label = significant), color = "black", size = 3) +
+  coord_cartesian(clip = "off")
+p_heat
+
+ggsave(out_file("gene_counts.eps"), p_heat, device = "eps", height = 12, width = 27, units = "cm")
+```
+
+# 7. Taxonomic composition of bacterial clusters
+
+```{r taxonomy-import}
+tax_df <- read_xlsx(in_file("genes_class.xlsx"))
+unique(tax_df$Class)
+```
+
+## Class-level composition per cluster
+
+```{r taxonomy-clusters}
+# Remove classes with < 1 % of genes within a cluster, then recompute relative abundance
+tax_rel <- tax_df %>%
+  group_by(cid.x, Class) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(cid.x) %>%
+  mutate(relative_abundance = count / sum(count)) %>%
+  dplyr::filter(relative_abundance >= 0.01) %>%
+  mutate(total_count = sum(count),
+         relative_abundance = count / total_count) %>%
+  ungroup()
+
+pal25 <- qualpal(25, colorspace = list(h = c(0, 360), s = c(0.3, 1), l = c(0.2, 0.8)))
+
+p_class <- ggplot(tax_rel, aes(x = cid.x, y = relative_abundance, fill = Class)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Relative Abundance of Organism Classes", x = "Class", y = "Relative Abundance") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal() +
+  facet_grid(~ cid.x, scales = "free_x") +
+  scale_fill_manual(values = pal25$hex) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_class
+# ggsave(out_file("cluster_class.eps"), p_class, device = "eps", units = "cm", height = 13, width = 20, dpi = 300)
+```
+
+## Class composition of the top-5 COG categories per cluster
+
+```{r taxonomy-cog, fig.height=9}
+tax_split <- tax_df %>%
+  mutate(COG_category = strsplit(as.character(COG_category), "")) %>%
+  unnest(COG_category) %>%
+  dplyr::filter(!COG_category %in% c("-", "NA", "S")) %>%
+  dplyr::filter(!Class %in% c("Cyanobacteria", "other", "Aconoidasida", "Halobacteria"))
+
+# Remove classes with < 5 % within a cluster x COG category, then recompute relative abundance
+tax_cog_rel <- tax_split %>%
+  group_by(cid.x, COG_category, Class) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(cid.x, COG_category) %>%
+  mutate(relative_abundance = count / sum(count)) %>%
+  dplyr::filter(relative_abundance >= 0.05) %>%
+  mutate(total_count = sum(count),
+         relative_abundance = count / total_count) %>%
+  ungroup()
+
+unique_gene_counts <- tax_split %>%
+  group_by(cid.x, COG_category) %>%
+  summarise(unique_gene_count = n_distinct(Gene_ID), .groups = "drop")
+
+top_cog_categories <- unique_gene_counts %>%
+  group_by(cid.x) %>%
+  top_n(5, wt = unique_gene_count) %>%
+  ungroup()
+
+bac_order <- c("Alphaproteobacteria", "Betaproteobacteria", "Gammaproteobacteria", "Deltaproteobacteria",
+               "Acidobacteriia", "Actinobacteria", "Aquificae", "Bacilli", "Clostridia",
+               "Bacteroidia", "Chloroflexia", "Deinococci", "Thermococci", "Verrucomicrobiae",
+               "not_annotated")
+
+tax_cog_top <- tax_cog_rel %>%
+  semi_join(top_cog_categories, by = c("cid.x", "COG_category")) %>%
+  left_join(unique_gene_counts, by = c("cid.x", "COG_category")) %>%
+  mutate(Class = factor(Class, levels = bac_order))
+
+pal21 <- qualpal(21, colorspace = list(h = c(0, 360), s = c(0.3, 1), l = c(0.2, 0.8)))
+
+p_cog_class <- ggplot(tax_cog_top, aes(x = COG_category, y = relative_abundance, fill = Class)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = unique_gene_count), position = position_stack(vjust = 1.05),
+            size = 3, color = "black") +
+  labs(title = "Relative Abundance of Organism Classes", x = "COG Category", y = "Relative Abundance") +
+  theme_minimal() +
+  scale_fill_manual(values = pal21$hex) +
+  facet_wrap(cid.x ~ ., scales = "free_x") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+p_cog_class
+
+ggsave(out_file("cluster_cog_class.eps"), p_cog_class, device = "eps",
+       units = "cm", height = 19, width = 19, dpi = 300)
+```
+
+# 8. PFAM odds ratios across bacterial clusters
+
+```{r pfam-import}
+set.seed(21)
+
+pfam <- read_delim(in_file("pfams_odds_upset.csv"), delim = ";")
+str(pfam)
+pfam <- as.data.frame(pfam)
+
+# Binary conversion: PFAM present (1) or absent (0) per cluster
+cluster_cols <- c("b_1", "b_10", "b_13", "b_14", "b_16", "b_3", "b_4", "b_6", "b_7", "b_9")
+pfam[cluster_cols] <- lapply(pfam[cluster_cols], function(x) as.integer(x > 0))
+```
+
+```{r pfam-upset, fig.width=10, fig.height=6}
+UpSetR::upset(
+  pfam,
+  sets = cluster_cols,
+  mainbar.y.label = "# Pfams",
+  sets.x.label = "Pfams/Cluster",
+  order.by = "freq",
+  decreasing = TRUE,
+  show.numbers = TRUE,
+  text.scale = c(1.2, 1.2, 1, 1, 1.5, 1)
+)
+```
+
+```{r pfam-bars, fig.width=6, fig.height=5}
+pfam_bars <- dplyr::filter(pfam, PFAMs != "ABC_tran")
+
+bars <- ggplot(pfam_bars, aes(x = reorder(PFAMs, sum), y = odds_ratio_fisher)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(x = "PFAMs (ordered by sum)", y = "Odds Ratio (Fisher)", title = "Odds Ratio by PFAM") +
+  theme_classic()
+bars
+
+ggsave(out_file("bars.eps"), bars, device = "eps", units = "cm", width = 9, height = 7)
+```
+
+# 9. Export gene tables for exploration
+
+```{r explore-export}
+explore_euk <- euk_annot %>%
+  dplyr::rename(Gene_ID = query) %>%
+  left_join(dplyr::select(euk_genes, Gene_ID, cid), by = "Gene_ID")
+# write_xlsx(explore_euk, out_file("explore_euk.xlsx"))
+
+explore_bac <- bac_annot %>%
+  dplyr::rename(Gene_ID = query) %>%
+  left_join(dplyr::select(bac_genes, Gene_ID, cid), by = "Gene_ID")
+write_xlsx(explore_bac, out_file("explore_bac_new.xlsx"))
+
+# Inspect individual clusters
+explore_h6 <- dplyr::filter(explore_euk, cid == "h_6")
+# write_xlsx(explore_h6, out_file("explore_h6.xlsx"))
+
+explore_b9 <- dplyr::filter(explore_bac, cid == "b_9")
+# write_xlsx(explore_b9, out_file("explore_m9.xlsx"))
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
